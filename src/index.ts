@@ -308,44 +308,108 @@ class CTFileV4API {
 		fileId: string,
 		accessToken: string
 	): Promise<{ code: number; download_url: string }> {
-		const normalizedId = /^[fd]\d+$/.test(fileId) ? fileId.slice(1) : fileId;
+		const originalId = fileId.trim();
+		const normalizedId = /^[fd]\d+$/.test(originalId) ? originalId.slice(1) : originalId;
 
-		// 1. 获取下载签名
-		const authResult = await this.post<{
+		const bareXtlink = xtlink.startsWith('ctfile://') ? xtlink.slice('ctfile://'.length) : xtlink;
+		const fullXtlink = `ctfile://${bareXtlink}`;
+
+		console.log(`[download] 正在获取下载签名: xtlink=${bareXtlink.slice(0, 15)}..., fileId=${originalId}`);
+
+		// 1. 获取下载签名：优先尝试原始 fileId (例如 f1420878136)，失败时再尝试无前缀 ID (1420878136)
+		let authResult: any = null;
+		let lastError: any = null;
+
+		const idVariants = originalId !== normalizedId ? [originalId, normalizedId] : [originalId];
+		const xtlinkVariants = [xtlink, fullXtlink, bareXtlink];
+		const seenCombos = new Set<string>();
+
+		for (const currentId of idVariants) {
+			for (const currentXtlink of xtlinkVariants) {
+				const comboKey = `${currentId}|${currentXtlink}`;
+				if (seenCombos.has(comboKey)) continue;
+				seenCombos.add(comboKey);
+
+				try {
+					authResult = await this.post<{
+						code: number;
+						data?: any;
+						download_signature?: string;
+						download_sign?: string;
+					}>(
+						'/v4/public/browser/create-download-auth',
+						{
+							xtlink: currentXtlink,
+							ids: currentId,
+						},
+						accessToken
+					);
+
+					const sig =
+						authResult?.data?.download_signature ||
+						authResult?.download_signature ||
+						authResult?.data?.download_sign ||
+						authResult?.download_sign;
+
+					if (sig) {
+						console.log(`[download] 成功获取下载签名 (ID=${currentId})`);
+						break;
+					}
+				} catch (err: any) {
+					lastError = err;
+					console.warn(`[download] 尝试 create-download-auth (ids=${currentId}) 失败:`, err.message);
+				}
+			}
+			if (
+				authResult?.data?.download_signature ||
+				authResult?.download_signature ||
+				authResult?.data?.download_sign ||
+				authResult?.download_sign
+			) {
+				break;
+			}
+		}
+
+		const signature =
+			authResult?.data?.download_signature ||
+			authResult?.download_signature ||
+			authResult?.data?.download_sign ||
+			authResult?.download_sign;
+
+		if (!signature) {
+			throw lastError || new Error('未能获取 download_signature 下载签名，可能是链接失效或无下载权限');
+		}
+
+		// 2. 换取直链
+		console.log(`[download] 正在换取直链...`);
+		const directResult = await this.post<{
 			code: number;
-			data?: { download_signature?: string };
-			download_signature?: string;
+			download_url?: string;
+			data?: any;
 		}>(
-			'/v4/public/browser/create-download-auth',
+			'/v4/file/browse/fetch-url-direct',
 			{
-				xtlink,
-				ids: normalizedId,
+				download_sign: signature,
+				carrier: CARRIER,
 			},
 			accessToken
 		);
 
-		const signature =
-			authResult.data?.download_signature || authResult.download_signature;
-		if (!signature) {
-			throw new Error('未能获取 download_signature 下载签名');
-		}
+		const downloadUrl =
+			directResult.download_url ||
+			directResult.data?.download_url ||
+			directResult.data?.url;
 
-		// 2. 换取直链
-		const directResult = await this.post<{
-			code: number;
-			download_url?: string;
-		}>('/v4/file/browse/fetch-url-direct', {
-			download_sign: signature,
-			carrier: CARRIER,
-		});
-
-		if (!directResult.download_url) {
+		if (!downloadUrl) {
+			console.error('[download] fetch-url-direct 未返回直链，响应内容:', directResult);
 			throw new Error('上游接口未返回 download_url 直链');
 		}
 
+		console.log(`[download] 成功解析直链: ${downloadUrl.slice(0, 40)}...`);
+
 		return {
 			code: 200,
-			download_url: directResult.download_url,
+			download_url: downloadUrl,
 		};
 	}
 }
