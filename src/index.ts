@@ -808,11 +808,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 			return;
 		}
 
-		const password = params.get('password');
-		const PASSWORD = process.env.PASSWORD;
+		const rawPasswordParam = params.get('password') || (req.headers['x-password'] as string) || '';
+		const inputPassword = rawPasswordParam.trim().replace(/^["']|["']$/g, '').trim();
+		const rawPasswordEnv = process.env.PASSWORD || '';
+		const configuredPassword = rawPasswordEnv.trim().replace(/^["']|["']$/g, '').trim();
 
 		if (pathname === '/login') {
-			if (!PASSWORD || password === PASSWORD) {
+			res.setHeader('Content-Type', 'application/json');
+			if (!configuredPassword || inputPassword === configuredPassword) {
 				res.writeHead(200);
 				res.end('true');
 				return;
@@ -823,9 +826,9 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 			}
 		}
 
-		if (PASSWORD && password !== PASSWORD) {
-			res.writeHead(403);
-			res.end('Wrong Password');
+		if (configuredPassword && inputPassword !== configuredPassword) {
+			res.writeHead(403, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ code: 403, error: 'Wrong Password' }));
 			return;
 		}
 
