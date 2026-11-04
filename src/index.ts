@@ -4,8 +4,16 @@ import * as http from 'http';
 import { URL } from 'url';
 
 const PORT = process.env.PORT || 8787;
-const STATE_FILE = path.join(process.cwd(), '.state.json');
-const TOKENS_FILE = path.join(process.cwd(), '.tokens.json');
+const DATA_DIR = process.env.DATA_DIR || process.cwd();
+if (!fs.existsSync(DATA_DIR)) {
+	try {
+		fs.mkdirSync(DATA_DIR, { recursive: true });
+	} catch (e) {
+		console.warn('Failed to create DATA_DIR:', e);
+	}
+}
+const STATE_FILE = path.join(DATA_DIR, '.state.json');
+const TOKENS_FILE = path.join(DATA_DIR, '.tokens.json');
 
 // 支持双模式：
 // 1. 'v4' (默认)：调用城通官方最新客户端 REST API v4 (https://api.ctfile.com/v4)，免费账号可用，支持扫码登录与多账号自动轮询刷新；
