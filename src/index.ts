@@ -208,27 +208,43 @@ class CTFileV4API {
 	async refreshToken(
 		refreshToken: string
 	): Promise<{ token: string; refresh_token?: string; expires_in?: number }> {
-		const res = await this.post<{
-			code: number;
-			data?: any;
-			token?: string;
-			refresh_token?: string;
-			expires_in?: number;
-		}>('/v4/user/auth/refresh-token', {
-			refresh_token: refreshToken,
-			rotate_token: true,
-		});
+		const doRefresh = async (rotate: boolean) => {
+			const res = await this.post<{
+				code: number;
+				data?: any;
+				token?: string;
+				refresh_token?: string;
+				expires_in?: number;
+			}>('/v4/user/auth/refresh-token', {
+				refresh_token: refreshToken,
+				...(rotate ? { rotate_token: true } : {}),
+			});
 
-		const token = res.token || res.data?.token || res.data?.access_token;
-		if (!token) {
-			throw new Error('刷新 Token 失败，上游未返回有效 access_token');
-		}
+			const token =
+				res.token ||
+				res.data?.token ||
+				res.data?.access_token ||
+				res.data?.accessToken;
+			if (!token) {
+				throw new Error('刷新 Token 失败，上游未返回有效 access_token');
+			}
 
-		return {
-			token,
-			refresh_token: res.refresh_token || res.data?.refresh_token || refreshToken,
-			expires_in: res.expires_in || res.data?.expires_in || 900,
+			return {
+				token,
+				refresh_token:
+					res.refresh_token || res.data?.refresh_token || res.data?.refreshToken || refreshToken,
+				expires_in: res.expires_in || res.data?.expires_in || 900,
+			};
 		};
+
+		// 优先尝试「不轮换」刷新，这样环境变量里的 refresh_token 可以一直复用；
+		// 如果上游要求必须轮换（返回错误），再退回到 rotate_token=true。
+		try {
+			return await doRefresh(false);
+		} catch (error) {
+			console.warn('不轮换刷新失败，改用 rotate_token=true 重试:', (error as Error).message);
+			return await doRefresh(true);
+		}
 	}
 
 	async list(
@@ -303,6 +319,14 @@ class CTFileV4API {
 		return allFiles;
 	}
 
+	// 创建下载授权并换取真实直链
+	// 正确的官方客户端调用链（2026-11 实测可用）：
+	//   1. POST /v4/public/browser/create-download-auth { xtlink, ids: "f1420878136" }
+	//        -> data.download_signature
+	//   2. (可选) POST /v4/file/browse/download-audit 上报审计
+	//   3. POST /v4/public/browser/fetch-url
+	//        { file_id: "1420878136", download_sign: <sig>, xtlink, carrier: 0 }
+	//        -> data.download_url  (真正的直链)
 	async download(
 		xtlink: string,
 		fileId: string,
@@ -310,102 +334,75 @@ class CTFileV4API {
 	): Promise<{ code: number; download_url: string }> {
 		const originalId = fileId.trim();
 		const normalizedId = /^[fd]\d+$/.test(originalId) ? originalId.slice(1) : originalId;
+		// create-download-auth 的 ids 字段需要带 f/d 前缀的原始 fid
+		const prefixedId = /^[fd]/.test(originalId) ? originalId : `f${originalId}`;
 
 		const bareXtlink = xtlink.startsWith('ctfile://') ? xtlink.slice('ctfile://'.length) : xtlink;
 		const fullXtlink = `ctfile://${bareXtlink}`;
 
-		console.log(`[download] 正在获取下载签名: xtlink=${bareXtlink.slice(0, 15)}..., fileId=${originalId}`);
+		console.log(`[download] 正在获取下载签名: xtlink=${bareXtlink.slice(0, 15)}..., fileId=${prefixedId}`);
 
-		// 1. 获取下载签名：优先尝试原始 fileId (例如 f1420878136)，失败时再尝试无前缀 ID (1420878136)
-		let authResult: any = null;
-		let lastError: any = null;
-
-		const idVariants = originalId !== normalizedId ? [originalId, normalizedId] : [originalId];
-		const xtlinkVariants = [xtlink, fullXtlink, bareXtlink];
-		const seenCombos = new Set<string>();
-
-		for (const currentId of idVariants) {
-			for (const currentXtlink of xtlinkVariants) {
-				const comboKey = `${currentId}|${currentXtlink}`;
-				if (seenCombos.has(comboKey)) continue;
-				seenCombos.add(comboKey);
-
-				try {
-					authResult = await this.post<{
-						code: number;
-						data?: any;
-						download_signature?: string;
-						download_sign?: string;
-					}>(
-						'/v4/public/browser/create-download-auth',
-						{
-							xtlink: currentXtlink,
-							ids: currentId,
-						},
-						accessToken
-					);
-
-					const sig =
-						authResult?.data?.download_signature ||
-						authResult?.download_signature ||
-						authResult?.data?.download_sign ||
-						authResult?.download_sign;
-
-					if (sig) {
-						console.log(`[download] 成功获取下载签名 (ID=${currentId})`);
-						break;
-					}
-				} catch (err: any) {
-					lastError = err;
-					console.warn(`[download] 尝试 create-download-auth (ids=${currentId}) 失败:`, err.message);
-				}
-			}
-			if (
-				authResult?.data?.download_signature ||
-				authResult?.download_signature ||
-				authResult?.data?.download_sign ||
-				authResult?.download_sign
-			) {
-				break;
-			}
-		}
+		// 1. 获取下载签名
+		const authResult = await this.post<{
+			code: number;
+			data?: {
+				download_signature?: string;
+				audit?: { url?: string; params?: Record<string, unknown> };
+			};
+			download_signature?: string;
+		}>(
+			'/v4/public/browser/create-download-auth',
+			{
+				xtlink: bareXtlink,
+				ids: prefixedId,
+			},
+			accessToken
+		);
 
 		const signature =
-			authResult?.data?.download_signature ||
-			authResult?.download_signature ||
-			authResult?.data?.download_sign ||
-			authResult?.download_sign;
-
+			authResult.data?.download_signature || authResult.download_signature;
 		if (!signature) {
-			throw lastError || new Error('未能获取 download_signature 下载签名，可能是链接失效或无下载权限');
+			throw new Error('未能获取 download_signature 下载签名，可能是链接失效或无下载权限');
 		}
 
-		// 2. 换取直链
+		// 2. 上报下载审计（可选，失败不影响后续）
+		const audit = authResult.data?.audit;
+		if (audit?.url && audit?.params) {
+			try {
+				await this.post(audit.url, audit.params, accessToken);
+			} catch (err: any) {
+				console.warn('[download] download-audit 上报失败（忽略）:', err.message);
+			}
+		}
+
+		// 3. 换取真实直链：/v4/public/browser/fetch-url
 		console.log(`[download] 正在换取直链...`);
 		const directResult = await this.post<{
 			code: number;
 			download_url?: string;
-			data?: any;
+			data?: { download_url?: string; url?: string };
 		}>(
-			'/v4/file/browse/fetch-url-direct',
+			'/v4/public/browser/fetch-url',
 			{
+				file_id: normalizedId,
 				download_sign: signature,
+				xtlink: bareXtlink,
 				carrier: CARRIER,
 			},
 			accessToken
 		);
 
 		const downloadUrl =
-			directResult.download_url ||
 			directResult.data?.download_url ||
+			directResult.download_url ||
 			directResult.data?.url;
 
 		if (!downloadUrl) {
-			console.error('[download] fetch-url-direct 未返回直链，响应内容:', directResult);
+			console.error('[download] fetch-url 未返回直链，响应内容:', directResult);
 			throw new Error('上游接口未返回 download_url 直链');
 		}
 
-		console.log(`[download] 成功解析直链: ${downloadUrl.slice(0, 40)}...`);
+		console.log(`[download] 成功解析直链: ${downloadUrl.slice(0, 60)}...`);
 
 		return {
 			code: 200,
@@ -528,6 +525,36 @@ function normalizeXtlink(xtlink: string): string {
 	return `${XTLINK_PREFIX}${bare}`;
 }
 
+// 每个账号独立的刷新锁，避免并发请求时因 rotate_token 导致 refresh_token 互相失效
+const refreshInFlight = new Map<string, Promise<string>>();
+
+async function refreshAccountToken(account: V4Account): Promise<string> {
+	if (!account.refreshToken) {
+		if (account.accessToken) return account.accessToken;
+		throw new Error(`账号 ${account.id} 无有效的 access_token 或 refresh_token`);
+	}
+
+	const existing = refreshInFlight.get(account.id);
+	if (existing) return existing;
+
+	const task = (async () => {
+		console.log(`正在为账号 ${account.id} 自动刷新 access_token...`);
+		const refreshResult = await v4Api.refreshToken(account.refreshToken!);
+		account.accessToken = refreshResult.token;
+		account.accessTokenExpiresAt = Date.now() + (refreshResult.expires_in || 900) * 1000;
+		if (refreshResult.refresh_token) {
+			account.refreshToken = refreshResult.refresh_token;
+		}
+		saveTokensFile();
+		return account.accessToken;
+	})().finally(() => {
+		refreshInFlight.delete(account.id);
+	});
+
+	refreshInFlight.set(account.id, task);
+	return task;
+}
+
 async function getV4AccessToken(): Promise<string> {
 	if (V4_ACCOUNTS.length === 0) {
 		throw new Error(
@@ -546,31 +573,14 @@ async function getV4AccessToken(): Promise<string> {
 		return account.accessToken;
 	}
 
-	// 否则尝试使用 refresh_token 刷新
-	if (account.refreshToken) {
-		try {
-			console.log(`正在为账号 ${account.id} 自动刷新 access_token...`);
-			const refreshResult = await v4Api.refreshToken(account.refreshToken);
-			account.accessToken = refreshResult.token;
-			account.accessTokenExpiresAt = now + (refreshResult.expires_in || 900) * 1000;
-			if (refreshResult.refresh_token) {
-				account.refreshToken = refreshResult.refresh_token;
-			}
-			saveTokensFile();
-			return account.accessToken;
-		} catch (error: any) {
-			console.error(`账号 ${account.id} 刷新 Token 失败:`, error.message);
-			// 如果当前账号已失效且有 accessToken，尝试降级使用原有 accessToken
-			if (account.accessToken) return account.accessToken;
-			throw error;
-		}
+	try {
+		return await refreshAccountToken(account);
+	} catch (error: any) {
+		console.error(`账号 ${account.id} 刷新 Token 失败:`, error.message);
+		// 如果当前账号已失效但仍有 accessToken，尝试降级使用原有 accessToken
+		if (account.accessToken) return account.accessToken;
+		throw error;
 	}
-
-	if (account.accessToken) {
-		return account.accessToken;
-	}
-
-	throw new Error(`账号 ${account.id} 无有效的 access_token 或 refresh_token`);
 }
 
 function getV1Session(): string {
@@ -1017,14 +1027,16 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 }
 
 function main(): void {
-	// 1. 加载持久化状态与已保存的 token
+	// 1. 加载持久化状态与已保存的 token（.tokens.json 中的凭据是最新的，因为刷新会轮换 refresh_token）
 	loadState();
 	loadTokensFile();
 
 	// 2. 加载环境变量中的 Tokens / RefreshTokens / Sessions
+	// 注意：refresh_token 在每次刷新时会被轮换（rotate_token），因此持久化文件里的 token 永远比环境变量更新。
+	// 一旦有过持久化记录，就忽略环境变量里的旧 token，避免加载已失效的初始 refresh_token。
 	const refreshTokensEnv =
 		process.env.REFRESH_TOKENS || process.env.TOKENS || process.env.WEB_TOKENS || '';
-	if (refreshTokensEnv) {
+	if (refreshTokensEnv && V4_ACCOUNTS.length === 0) {
 		const tokens = refreshTokensEnv
 			.split(',')
 			.map((t) => t.trim())
