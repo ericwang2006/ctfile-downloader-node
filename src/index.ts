@@ -247,6 +247,20 @@ class CTFileV4API {
 		}
 	}
 
+	// 验证一个 access_token 是否有效（调用轻量的用户信息接口）
+	async verifyAccessToken(accessToken: string): Promise<boolean> {
+		try {
+			const res = await this.post<{ code: number }>(
+				'/v4/user/profile/info',
+				{},
+				accessToken
+			);
+			return res.code === 200;
+		} catch {
+			return false;
+		}
+	}
+
 	async list(
 		xtlink: string,
 		accessToken: string,
@@ -680,12 +694,89 @@ function renderQrLoginPage(): string {
       font-size: 12px;
       color: #9ca3af;
     }
+    .divider {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 22px 0 14px;
+      color: #9ca3af;
+      font-size: 12px;
+    }
+    .divider::before, .divider::after {
+      content: "";
+      flex: 1;
+      height: 1px;
+      background: #e5e7eb;
+    }
+    textarea {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      padding: 10px;
+      font-size: 13px;
+      font-family: inherit;
+      resize: vertical;
+      min-height: 60px;
+    }
+    textarea:focus { outline: none; border-color: #2563eb; }
+    .btn-secondary {
+      background: #f3f4f6;
+      color: #374151;
+      margin-top: 8px;
+      width: 100%;
+    }
+    .btn-secondary:hover { background: #e5e7eb; }
+    .hint {
+      font-size: 12px;
+      color: #9ca3af;
+      text-align: left;
+      line-height: 1.6;
+      margin-top: 8px;
+    }
+    .hint code { background: #f3f4f6; padding: 1px 4px; border-radius: 4px; }
+    .account-list {
+      margin-top: 14px;
+      text-align: left;
+      font-size: 13px;
+    }
+    .account-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 10px;
+      border: 1px solid #eef0f3;
+      border-radius: 8px;
+      margin-bottom: 6px;
+      background: #fafafa;
+    }
+    .account-item .meta { color: #6b7280; font-size: 12px; }
+    .account-item .del {
+      color: #dc2626;
+      cursor: pointer;
+      font-size: 12px;
+      background: none;
+      border: none;
+      padding: 4px 6px;
+    }
+    .account-item .del:hover { text-decoration: underline; }
+    details.manual { margin-top: 4px; text-align: left; }
+    details.manual summary {
+      cursor: pointer;
+      font-size: 13px;
+      color: #2563eb;
+      list-style: none;
+      user-select: none;
+      padding: 6px 0;
+    }
+    details.manual summary::-webkit-details-marker { display: none; }
+    details.manual summary:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
   <div class="card">
     <span class="badge">免费账号可用 · 无需会员</span>
-    <h1>城通网盘扫码登录</h1>
+    <h1>城通网盘账号登录</h1>
     <p class="desc">打开<strong>城通网盘手机 App</strong>，使用扫一扫扫描下方二维码完成授权。授权后系统将自动保存并在后台持久化自动续期。</p>
     <div class="qr-container" id="qrContainer">
       <span id="loadingText" style="color: #9ca3af; font-size: 13px;">正在生成二维码...</span>
@@ -695,7 +786,20 @@ function renderQrLoginPage(): string {
     <div>
       <button class="btn" id="refreshBtn" onclick="initQr()">刷新二维码</button>
     </div>
+
+    <div class="divider">或手动添加 Token</div>
+    <details class="manual">
+      <summary>▸ 没有 App？点这里粘贴 refresh_token</summary>
+      <textarea id="manualToken" placeholder="粘贴 refresh_token（或 access_token）"></textarea>
+      <input id="manualUser" placeholder="备注名（可选）" style="width:100%;box-sizing:border-box;border:1px solid #d1d5db;border-radius:8px;padding:8px 10px;font-size:13px;margin-top:8px;">
+      <button class="btn btn-secondary" onclick="submitToken()">添加账号</button>
+      <div class="hint" id="manualHint">
+        获取方法：浏览器登录 <code>pan.ctfile.com</code> → 按 F12 → Application → Session Storage → 复制 <code>refresh_token</code> 的值。
+      </div>
+    </details>
+
     <div class="stats" id="accountsStats">加载账号状态中...</div>
+    <div class="account-list" id="accountList"></div>
   </div>
 
   <script>
@@ -708,7 +812,68 @@ function renderQrLoginPage(): string {
         const data = await res.json();
         const el = document.getElementById('accountsStats');
         el.innerHTML = '已配置可用账号数: <strong>' + data.count + '</strong> (模式: ' + data.mode + ')';
+
+        const listEl = document.getElementById('accountList');
+        if (data.count > 0 && data.accounts) {
+          listEl.innerHTML = data.accounts.map(function (a) {
+            var exp = a.hasAccessToken ? ('access_token 剩余 ' + a.expiresInSeconds + 's') : '待刷新';
+            return '<div class="account-item"><span>' +
+              (a.username ? a.username + ' ' : '') +
+              '<span class="meta">#' + a.index + ' · ' + exp + '</span></span>' +
+              '<button class="del" onclick="deleteAccount(' + a.index + ')">删除</button></div>';
+          }).join('');
+        } else {
+          listEl.innerHTML = '';
+        }
       } catch (e) {}
+    }
+
+    async function deleteAccount(index) {
+      if (!confirm('确定要删除该账号吗？')) return;
+      try {
+        const res = await fetch('/auth/accounts/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ index: index })
+        });
+        const data = await res.json();
+        if (data.code === 200) loadStats();
+      } catch (e) { alert('删除失败: ' + e.message); }
+    }
+
+    async function submitToken() {
+      const hint = document.getElementById('manualHint');
+      const token = document.getElementById('manualToken').value.trim();
+      const username = document.getElementById('manualUser').value.trim();
+      if (!token) { hint.textContent = '请先粘贴 token'; hint.style.color = '#dc2626'; return; }
+      hint.textContent = '正在验证并添加...';
+      hint.style.color = '#6b7280';
+      try {
+        const res = await fetch('/auth/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: token, username: username })
+        });
+        const data = await res.json();
+        if (data.code === 200) {
+          if (data.verified === false) {
+            hint.textContent = '已保存，但验证失败: ' + (data.verifyError || 'token 可能无效');
+            hint.style.color = '#d97706';
+          } else {
+            hint.textContent = '✅ 添加成功！当前账号数：' + data.count;
+            hint.style.color = '#059669';
+            document.getElementById('manualToken').value = '';
+            document.getElementById('manualUser').value = '';
+          }
+          loadStats();
+        } else {
+          hint.textContent = '❌ ' + (data.error || '添加失败');
+          hint.style.color = '#dc2626';
+        }
+      } catch (e) {
+        hint.textContent = '❌ 请求失败: ' + e.message;
+        hint.style.color = '#dc2626';
+      }
     }
 
     async function initQr() {
@@ -777,6 +942,93 @@ function renderQrLoginPage(): string {
 </html>`;
 }
 
+// 读取请求体（支持 JSON / 表单 / 纯文本）
+async function readBody(req: http.IncomingMessage): Promise<Record<string, string>> {
+	return new Promise((resolve) => {
+		let raw = '';
+		let done = false;
+		const finish = () => {
+			if (done) return;
+			done = true;
+			const result: Record<string, string> = {};
+			if (!raw) return resolve(result);
+			try {
+				const parsed = JSON.parse(raw);
+				if (parsed && typeof parsed === 'object') {
+					for (const [k, v] of Object.entries(parsed)) {
+						result[k] = typeof v === 'string' ? v : String(v ?? '');
+					}
+					return resolve(result);
+				}
+			} catch {
+				// 不是 JSON，继续尝试表单编码
+			}
+			try {
+				const usp = new URLSearchParams(raw);
+				for (const [k, v] of usp.entries()) result[k] = v;
+			} catch {
+				result.raw = raw.trim();
+			}
+			resolve(result);
+		};
+
+		req.on('data', (chunk) => {
+			raw += chunk;
+			if (raw.length > 1024 * 64) {
+				finish();
+				req.destroy();
+			}
+		});
+		req.on('end', finish);
+		req.on('error', finish);
+		// 兜底：3 秒后仍未结束则按已读取内容处理
+		setTimeout(finish, 3000);
+	});
+}
+
+// 将 token 加入账号池（去重 + 持久化），返回是否为新增
+function addV4Account(input: {
+	refreshToken?: string;
+	accessToken?: string;
+	expiresIn?: number;
+	username?: string;
+	id?: string;
+}): { added: boolean; account: V4Account } {
+	const refreshToken = input.refreshToken?.trim();
+	const accessToken = input.accessToken?.trim();
+	if (!refreshToken && !accessToken) {
+		throw new Error('refresh_token 与 access_token 至少需要提供一个');
+	}
+
+	const exists = V4_ACCOUNTS.find(
+		(a) =>
+			(refreshToken && a.refreshToken === refreshToken) ||
+			(accessToken && a.accessToken === accessToken)
+	);
+	if (exists) {
+		// 已存在则更新
+		if (refreshToken) exists.refreshToken = refreshToken;
+		if (accessToken) {
+			exists.accessToken = accessToken;
+			exists.accessTokenExpiresAt = Date.now() + (input.expiresIn || 900) * 1000;
+		}
+		if (input.username) exists.username = input.username;
+		saveTokensFile();
+		return { added: false, account: exists };
+	}
+
+	const account: V4Account = {
+		id: input.id || `manual-${V4_ACCOUNTS.length + 1}`,
+		refreshToken,
+		accessToken,
+		accessTokenExpiresAt: accessToken ? Date.now() + (input.expiresIn || 900) * 1000 : 0,
+		username: input.username,
+	};
+	V4_ACCOUNTS.push(account);
+	saveTokensFile();
+	return { added: true, account };
+}
+
 async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
 	const url = new URL(req.url || '', `http://${req.headers.host}`);
 	const params = url.searchParams;
@@ -793,7 +1045,9 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 		return;
 	}
 
-	if (req.method !== 'GET') {
+	const POST_PATHS = new Set(['/auth/token', '/auth/accounts/delete']);
+	const postAllowed = req.method === 'POST' && POST_PATHS.has(pathname);
+	if (req.method !== 'GET' && !postAllowed) {
 		res.writeHead(405);
 		res.end('Method Not Allowed');
 		return;
@@ -879,6 +1133,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 					accounts: V4_ACCOUNTS.map((a, i) => ({
 						index: i,
 						id: a.id,
+						username: a.username,
 						hasRefreshToken: Boolean(a.refreshToken),
 						hasAccessToken: Boolean(a.accessToken),
 						expiresInSeconds: a.accessTokenExpiresAt
@@ -887,6 +1142,147 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 					})),
 				})
 			);
+			return;
+		}
+
+		// 手动添加账号：POST /auth/token
+		// 支持 body（JSON 或表单）或 query：
+		//   token         —— 通用字段，自动判断是 refresh_token 还是 access_token
+		//   refresh_token —— 明确指定 refresh_token
+		//   access_token  —— 明确指定 access_token
+		//   username / id / expires_in —— 可选
+		if (pathname === '/auth/token' && req.method === 'POST') {
+			const body = await readBody(req);
+			const explicitRefresh =
+				body.refresh_token || body.refreshToken || params.get('refresh_token') || '';
+			const explicitAccess =
+				body.access_token || body.accessToken || params.get('access_token') || '';
+			const generic = body.token || params.get('token') || '';
+			const username = body.username || params.get('username') || undefined;
+			const expiresIn = Number(body.expires_in || params.get('expires_in') || 0) || undefined;
+			const id = body.id || params.get('id') || undefined;
+
+			const tryRefresh = async (rt: string) => {
+				const r = await v4Api.refreshToken(rt);
+				return r;
+			};
+
+			try {
+				let verified: boolean | null = null;
+				let verifyError: string | null = null;
+				let usedAs = '';
+				let added = false;
+				let accountId = '';
+
+				if (explicitRefresh) {
+					// 明确是 refresh_token：尝试刷新验证
+					try {
+						const r = await tryRefresh(explicitRefresh);
+						const res1 = addV4Account({
+							refreshToken: r.refresh_token || explicitRefresh,
+							accessToken: r.token,
+							expiresIn: r.expires_in || expiresIn,
+							username,
+							id,
+						});
+						added = res1.added;
+						accountId = res1.account.id;
+						usedAs = 'refresh_token';
+						verified = true;
+					} catch (err: any) {
+						verified = false;
+						verifyError = err.message;
+						const res1 = addV4Account({ refreshToken: explicitRefresh, username, id });
+						added = res1.added;
+						accountId = res1.account.id;
+						usedAs = 'refresh_token';
+					}
+				} else if (explicitAccess) {
+					const ok = await v4Api.verifyAccessToken(explicitAccess);
+					if (!ok) throw new Error('access_token 无效或已过期');
+					const res1 = addV4Account({
+						accessToken: explicitAccess,
+						expiresIn,
+						username,
+						id,
+					});
+					added = res1.added;
+					accountId = res1.account.id;
+					usedAs = 'access_token';
+					verified = true;
+				} else if (generic) {
+					// 通用字段：先当作 refresh_token，失败再当作 access_token
+					try {
+						const r = await tryRefresh(generic);
+						const res1 = addV4Account({
+							refreshToken: r.refresh_token || generic,
+							accessToken: r.token,
+							expiresIn: r.expires_in || expiresIn,
+							username,
+							id,
+						});
+						added = res1.added;
+						accountId = res1.account.id;
+						usedAs = 'refresh_token';
+						verified = true;
+					} catch (refreshErr: any) {
+						const ok = await v4Api.verifyAccessToken(generic);
+						if (!ok) {
+							throw new Error(
+								`token 无效：作为 refresh_token 刷新失败（${refreshErr.message}），作为 access_token 也无法通过验证`
+							);
+						}
+						const res1 = addV4Account({ accessToken: generic, expiresIn, username, id });
+						added = res1.added;
+						accountId = res1.account.id;
+						usedAs = 'access_token';
+						verified = true;
+					}
+				} else {
+					throw new Error('请提供 token / refresh_token / access_token');
+				}
+
+				res.writeHead(200, { 'Content-Type': 'application/json' });
+				res.end(
+					JSON.stringify({
+						code: 200,
+						added,
+						verified,
+						verifyError,
+						usedAs,
+						count: V4_ACCOUNTS.length,
+						accountId,
+					})
+				);
+			} catch (err: any) {
+				res.writeHead(400, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ code: 400, error: err.message }));
+			}
+			return;
+		}
+
+		// 删除账号：POST /auth/accounts/delete  body/query: index 或 id
+		if (pathname === '/auth/accounts/delete' && req.method === 'POST') {
+			const body = await readBody(req);
+			const indexStr = body.index ?? params.get('index');
+			const id = body.id || params.get('id');
+
+			let removed = 0;
+			if (indexStr !== undefined && indexStr !== null && indexStr !== '') {
+				const idx = Number(indexStr);
+				if (Number.isInteger(idx) && idx >= 0 && idx < V4_ACCOUNTS.length) {
+					V4_ACCOUNTS.splice(idx, 1);
+					removed = 1;
+				}
+			} else if (id) {
+				const before = V4_ACCOUNTS.length;
+				V4_ACCOUNTS = V4_ACCOUNTS.filter((a) => a.id !== id);
+				removed = before - V4_ACCOUNTS.length;
+			}
+
+			saveTokensFile();
+			res.writeHead(200, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ code: 200, removed, count: V4_ACCOUNTS.length }));
 			return;
 		}
 
