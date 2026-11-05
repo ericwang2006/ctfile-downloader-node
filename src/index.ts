@@ -24,6 +24,44 @@ const V1_API_BASE = (process.env.CTFILE_V1_API_BASE || 'https://rest.ctfile.com/
 const XTLINK_PREFIX = process.env.CTFILE_XTLINK_PREFIX || '';
 const CARRIER = process.env.CTFILE_CARRIER ? Number(process.env.CTFILE_CARRIER) : 0;
 
+// 上游并发与重试配置。
+// 20 个 aria2 线程会同时请求 /download，每个请求都要访问城通上游若干次；
+// 不做限流时容易触发上游的风控/限流（返回空响应、HTML 或直接断开连接），
+// 表现为本服务返回 500/502，aria2 只看到 "status=500"。
+const UPSTREAM_MAX_CONCURRENCY = Math.max(
+	1,
+	Number(process.env.UPSTREAM_MAX_CONCURRENCY) || 6
+);
+const UPSTREAM_RETRY_TIMES = Math.max(0, Number(process.env.UPSTREAM_RETRY_TIMES) || 3);
+const UPSTREAM_RETRY_BASE_DELAY_MS = Math.max(
+	50,
+	Number(process.env.UPSTREAM_RETRY_BASE_DELAY_MS) || 300
+);
+const UPSTREAM_TIMEOUT_MS = Math.max(
+	1000,
+	Number(process.env.UPSTREAM_TIMEOUT_MS) || 20000
+);
+// 单个 /download 请求最多尝试几个账号（某个账号 token 失效时自动换号重试）
+const DOWNLOAD_ACCOUNT_ATTEMPTS = Math.max(
+	1,
+	Number(process.env.DOWNLOAD_ACCOUNT_ATTEMPTS) || 3
+);
+
+// 城通直链里的 limit=2 表示该直链允许 2 个并发连接。
+// aria2 的 20 个线程如果每个线程都重新解析一次，就会产生 20 次上游请求；
+// 默认把每条直链复用 limit 次（通常 2 次），可把上游请求数减半。
+const DOWNLOAD_URL_REUSE = !/^(0|false|no)$/i.test(
+	(process.env.DOWNLOAD_URL_REUSE || '1').trim()
+);
+const DOWNLOAD_URL_CACHE_TTL_MS = Math.max(
+	1000,
+	Number(process.env.DOWNLOAD_URL_CACHE_TTL_MS) || 15000
+);
+const DOWNLOAD_URL_MAX_USES = Math.max(
+	1,
+	Number(process.env.DOWNLOAD_URL_MAX_USES) || 4
+);
+
 interface AppState {
 	tokenIndex: number;
 }
@@ -126,12 +164,135 @@ class UpstreamError extends Error {
 	}
 }
 
+// 网络错误、上游 5xx、上游返回非 JSON（常见于风控/限流页面）等可重试错误
+class UpstreamNetworkError extends Error {
+	status?: number;
+
+	constructor(message: string, status?: number) {
+		super(message);
+		this.name = 'UpstreamNetworkError';
+		this.status = status;
+	}
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// 简单信号量：限制同时发往城通上游的请求数量，避免 20 线程瞬间打满触发风控
+class Semaphore {
+	private active = 0;
+	private queue: Array<() => void> = [];
+
+	constructor(private readonly limit: number) {}
+
+	async acquire(): Promise<void> {
+		if (this.active < this.limit) {
+			this.active++;
+			return;
+		}
+		await new Promise<void>((resolve) => this.queue.push(resolve));
+	}
+
+	release(): void {
+		const next = this.queue.shift();
+		if (next) {
+			// 直接把槽位交给下一个等待者，不再减少 active
+			next();
+			return;
+		}
+		this.active--;
+	}
+}
+
+// 按 key 串行执行任务，用于把同一个文件的直链解析串行化，
+// 避免 20 个 aria2 线程同时为同一个文件请求 20 次上游。
+class KeyedMutex {
+	private tails = new Map<string, Promise<void>>();
+
+	run<T>(key: string, task: () => Promise<T>): Promise<T> {
+		const previous = this.tails.get(key) ?? Promise.resolve();
+		const result = previous.then(task, task);
+		const tail = result.then(
+			() => undefined,
+			() => undefined
+		);
+		this.tails.set(key, tail);
+		tail.then(() => {
+			if (this.tails.get(key) === tail) {
+				this.tails.delete(key);
+			}
+		});
+		return result;
+	}
+}
+
+const downloadUrlMutex = new KeyedMutex();
+
+const upstreamSemaphore = new Semaphore(UPSTREAM_MAX_CONCURRENCY);
+
+async function withUpstreamSlot<T>(task: () => Promise<T>): Promise<T> {
+	await upstreamSemaphore.acquire();
+	try {
+		return await task();
+	} finally {
+		upstreamSemaphore.release();
+	}
+}
+
+function isRetryableStatus(status: number): boolean {
+	return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function isRetryableUpstreamError(error: unknown): boolean {
+	if (error instanceof UpstreamNetworkError) return true;
+
+	const message = String((error as Error)?.message || '').toLowerCase();
+	return /fetch failed|network|socket|econnreset|etimedout|eai_again|other side closed|terminated|aborted|timeout/.test(
+		message
+	);
+}
+
 // ======================== v4 客户端接口实现 (免费账号免会员) ========================
 class CTFileV4API {
 	private async post<T>(
 		endpoint: string,
 		payload: Record<string, unknown>,
-		accessToken?: string
+		accessToken?: string,
+		options: { retries?: number; timeoutMs?: number } = {}
+	): Promise<T> {
+		const retries = options.retries ?? UPSTREAM_RETRY_TIMES;
+		const timeoutMs = options.timeoutMs ?? UPSTREAM_TIMEOUT_MS;
+		let lastError: unknown;
+
+		for (let attempt = 0; attempt <= retries; attempt++) {
+			try {
+				return await withUpstreamSlot(() =>
+					this.postOnce<T>(endpoint, payload, accessToken, timeoutMs)
+				);
+			} catch (error: any) {
+				lastError = error;
+				if (attempt >= retries || !isRetryableUpstreamError(error)) {
+					throw error;
+				}
+				const delay =
+					UPSTREAM_RETRY_BASE_DELAY_MS * Math.pow(2, attempt) +
+					Math.floor(Math.random() * 100);
+				console.warn(
+					`[upstream] ${endpoint} 第 ${attempt + 1} 次请求失败: ${error.message}；${delay}ms 后重试...`
+				);
+				await sleep(delay);
+			}
+		}
+
+		throw lastError;
+	}
+
+	private async postOnce<T>(
+		endpoint: string,
+		payload: Record<string, unknown>,
+		accessToken: string | undefined,
+		timeoutMs: number
 	): Promise<T> {
 		const url = `${V4_API_BASE}${endpoint}`;
 		const headers: Record<string, string> = { ...V4_CLIENT_HEADERS };
@@ -145,21 +306,51 @@ class CTFileV4API {
 				method: 'POST',
 				headers,
 				body: JSON.stringify(payload),
+				signal: AbortSignal.timeout(timeoutMs),
 			});
 		} catch (error: any) {
-			throw new Error(`无法连接上游 API ${url}: ${error.message}`);
+			throw new UpstreamNetworkError(`无法连接上游 API ${url}: ${error.message}`);
 		}
 
-		const text = await response.text();
+		let text: string;
+		try {
+			text = await response.text();
+		} catch (error: any) {
+			throw new UpstreamNetworkError(
+				`读取上游响应失败 (HTTP ${response.status}): ${error.message}`,
+				response.status
+			);
+		}
+
+		// 429/5xx 通常是临时限流或上游故障，交给外层重试
+		if (isRetryableStatus(response.status)) {
+			throw new UpstreamNetworkError(
+				`上游返回 HTTP ${response.status}: ${text.slice(0, 200)}`,
+				response.status
+			);
+		}
+
 		let data: any;
 		try {
 			data = text ? JSON.parse(text) : {};
 		} catch {
-			throw new Error(`上游返回非 JSON 响应 (HTTP ${response.status}): ${text.slice(0, 200)}`);
+			// 上游被风控时经常返回 HTML 或空响应，这类错误也应重试
+			throw new UpstreamNetworkError(
+				`上游返回非 JSON 响应 (HTTP ${response.status}): ${text.slice(0, 200)}`,
+				response.status
+			);
 		}
 
 		if (data && typeof data.code !== 'undefined' && data.code !== 200) {
-			throw new UpstreamError(Number(data.code), data.message || `上游返回错误码 ${data.code}`);
+			const code = Number(data.code);
+			// 上游业务码为 429，或提示“频繁/稍后再试”时，按可重试的限流处理
+			if (code === 429 || /频繁|稍后|限流|too many|rate limit/i.test(String(data.message || ''))) {
+				throw new UpstreamNetworkError(
+					data.message || `上游限流 (code=${data.code})`,
+					code === 429 ? 429 : 503
+				);
+			}
+			throw new UpstreamError(code, data.message || `上游返回错误码 ${data.code}`);
 		}
 
 		return data as T;
@@ -215,10 +406,17 @@ class CTFileV4API {
 				token?: string;
 				refresh_token?: string;
 				expires_in?: number;
-			}>('/v4/user/auth/refresh-token', {
-				refresh_token: refreshToken,
-				...(rotate ? { rotate_token: true } : {}),
-			});
+			}>(
+				'/v4/user/auth/refresh-token',
+				{
+					refresh_token: refreshToken,
+					...(rotate ? { rotate_token: true } : {}),
+				},
+				undefined,
+				// 不轮换的刷新是幂等的，可以安全重试；
+				// rotate_token=true 可能已经在上游完成轮换，重试反而会失败，因此不重试。
+				{ retries: rotate ? 0 : UPSTREAM_RETRY_TIMES }
+			);
 
 			const token =
 				res.token ||
@@ -352,7 +550,6 @@ class CTFileV4API {
 		const prefixedId = /^[fd]/.test(originalId) ? originalId : `f${originalId}`;
 
 		const bareXtlink = xtlink.startsWith('ctfile://') ? xtlink.slice('ctfile://'.length) : xtlink;
-		const fullXtlink = `ctfile://${bareXtlink}`;
 
 		console.log(`[download] 正在获取下载签名: xtlink=${bareXtlink.slice(0, 15)}..., fileId=${prefixedId}`);
 
@@ -376,14 +573,17 @@ class CTFileV4API {
 		const signature =
 			authResult.data?.download_signature || authResult.download_signature;
 		if (!signature) {
-			throw new Error('未能获取 download_signature 下载签名，可能是链接失效或无下载权限');
+			throw new UpstreamError(
+				502,
+				'未能获取 download_signature 下载签名，可能是链接失效、账号无下载权限或上游限流'
+			);
 		}
 
-		// 2. 上报下载审计（可选，失败不影响后续）
+		// 2. 上报下载审计（可选，失败不影响后续；不重试以免拖慢下载）
 		const audit = authResult.data?.audit;
 		if (audit?.url && audit?.params) {
 			try {
-				await this.post(audit.url, audit.params, accessToken);
+				await this.post(audit.url, audit.params, accessToken, { retries: 0 });
 			} catch (err: any) {
 				console.warn('[download] download-audit 上报失败（忽略）:', err.message);
 			}
@@ -413,7 +613,7 @@ class CTFileV4API {
 
 		if (!downloadUrl) {
 			console.error('[download] fetch-url 未返回直链，响应内容:', directResult);
-			throw new Error('上游接口未返回 download_url 直链');
+			throw new UpstreamError(502, '上游接口未返回 download_url 直链');
 		}
 
 		console.log(`[download] 成功解析直链: ${downloadUrl.slice(0, 60)}...`);
@@ -569,7 +769,7 @@ async function refreshAccountToken(account: V4Account): Promise<string> {
 	return task;
 }
 
-async function getV4AccessToken(): Promise<string> {
+function nextV4Account(): V4Account {
 	if (V4_ACCOUNTS.length === 0) {
 		throw new Error(
 			'未配置可用账号。你可以访问服务主页上的「/qr」页面，使用城通网盘手机 App 扫码登录（无需会员）；或者在环境变量中配置 REFRESH_TOKENS。'
@@ -580,7 +780,10 @@ async function getV4AccessToken(): Promise<string> {
 	const account = V4_ACCOUNTS[index];
 	appState.tokenIndex = (index + 1) % V4_ACCOUNTS.length;
 	saveState();
+	return account;
+}
 
+async function getV4AccessTokenForAccount(account: V4Account): Promise<string> {
 	const now = Date.now();
 	// 如果已有有效 access_token（且距离过期还有 60 秒以上），直接使用
 	if (account.accessToken && account.accessTokenExpiresAt && account.accessTokenExpiresAt > now + 60000) {
@@ -595,6 +798,134 @@ async function getV4AccessToken(): Promise<string> {
 		if (account.accessToken) return account.accessToken;
 		throw error;
 	}
+}
+
+async function getV4AccessToken(): Promise<string> {
+	return getV4AccessTokenForAccount(nextV4Account());
+}
+
+// 某些错误换个账号就能成功（token 过期/被风控/无下载权限），
+// 这类错误在 /download 里自动轮换账号重试，避免 aria2 的一个线程直接失败。
+function isAccountRetryable(error: unknown): boolean {
+	if (error instanceof UpstreamError) {
+		// 400/404 通常是链接或文件本身无效，换账号也没用
+		return error.code !== 400 && error.code !== 404;
+	}
+	return true;
+}
+
+async function resolveV4DownloadUrl(
+	xtlink: string,
+	fileId: string,
+	customToken?: string
+): Promise<string> {
+	if (customToken) {
+		const result = await v4Api.download(xtlink, fileId, customToken);
+		return result.download_url;
+	}
+
+	const totalAccounts = V4_ACCOUNTS.length;
+	if (totalAccounts === 0) {
+		throw new Error(
+			'未配置可用账号。你可以访问服务主页上的「/qr」页面，使用城通网盘手机 App 扫码登录（无需会员）；或者在环境变量中配置 REFRESH_TOKENS。'
+		);
+	}
+
+	const attempts = Math.min(DOWNLOAD_ACCOUNT_ATTEMPTS, totalAccounts);
+	let lastError: unknown;
+
+	for (let attempt = 0; attempt < attempts; attempt++) {
+		const account = nextV4Account();
+		try {
+			const token = await getV4AccessTokenForAccount(account);
+			const result = await v4Api.download(xtlink, fileId, token);
+			if (!result.download_url) {
+				throw new UpstreamError(502, '上游接口未返回 download_url 直链');
+			}
+			return result.download_url;
+		} catch (error: any) {
+			lastError = error;
+			console.warn(
+				`[download] 账号 ${account.id} 解析直链失败 (${attempt + 1}/${attempts}): ${error.message}`
+			);
+			if (attempt >= attempts - 1 || !isAccountRetryable(error)) {
+				throw error;
+			}
+			// 换下一个账号前稍作退避，避免在限流时继续加压
+			await sleep(200 * (attempt + 1) + Math.floor(Math.random() * 100));
+		}
+	}
+
+	throw lastError;
+}
+
+interface PooledDownloadUrl {
+	url: string;
+	remainingUses: number;
+	expiresAt: number;
+}
+
+// 同一个 xtlink + file_id 的直链池
+const downloadUrlPool = new Map<string, PooledDownloadUrl[]>();
+
+function parseUrlUseLimit(downloadUrl: string): number {
+	try {
+		const limit = Number(new URL(downloadUrl).searchParams.get('limit'));
+		if (!Number.isFinite(limit) || limit < 1) return 1;
+		return Math.min(Math.floor(limit), DOWNLOAD_URL_MAX_USES);
+	} catch {
+		return 1;
+	}
+}
+
+// /download 专用：优先复用还没达到并发上限的直链，
+// 同一个文件同时只有一个请求在向上游解析，避免 20 线程造成 20 次解析。
+async function acquireV4DownloadUrl(
+	xtlink: string,
+	fileId: string,
+	customToken?: string
+): Promise<string> {
+	// 调用方显式指定 token 时不使用共享池，避免把其他账号的直链返回给它
+	if (customToken || !DOWNLOAD_URL_REUSE) {
+		return resolveV4DownloadUrl(xtlink, fileId, customToken);
+	}
+
+	// f123 和 123 指向同一个文件，统一成不带前缀的形式作为缓存 key
+	const normalizedFileId = /^[fd]\d+$/.test(fileId.trim()) ? fileId.trim().slice(1) : fileId.trim();
+	const key = `${xtlink}|${normalizedFileId}`;
+	return downloadUrlMutex.run(key, async () => {
+		const now = Date.now();
+		const pool = (downloadUrlPool.get(key) || []).filter(
+			(entry) => entry.expiresAt > now && entry.remainingUses > 0
+		);
+
+		const reusable = pool.shift();
+		if (reusable) {
+			reusable.remainingUses--;
+			if (reusable.remainingUses > 0) {
+				pool.unshift(reusable);
+			}
+			downloadUrlPool.set(key, pool);
+			console.log(
+				`[download] 复用直链（剩余 ${reusable.remainingUses} 次）: ${reusable.url.slice(0, 60)}...`
+			);
+			return reusable.url;
+		}
+
+		const url = await resolveV4DownloadUrl(xtlink, fileId);
+		const maxUses = parseUrlUseLimit(url);
+		if (maxUses > 1) {
+			pool.push({
+				url,
+				remainingUses: maxUses - 1,
+				expiresAt: Date.now() + DOWNLOAD_URL_CACHE_TTL_MS,
+			});
+			downloadUrlPool.set(key, pool);
+		} else {
+			downloadUrlPool.delete(key);
+		}
+		return url;
+	});
 }
 
 function getV1Session(): string {
@@ -1329,11 +1660,9 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 				const result = await v1Api.download(xtlink, file_id, session);
 				upstreamUrl = result.download_url;
 			} else {
-				// v4 客户端协议模式
-				const customToken = params.get('token') || params.get('session');
-				const token = customToken || (await getV4AccessToken());
-				const result = await v4Api.download(xtlink, file_id, token);
-				upstreamUrl = result.download_url;
+				// v4 客户端协议模式：失败时自动换账号重试，同一文件的直链按 limit 复用
+				const customToken = params.get('token') || params.get('session') || undefined;
+				upstreamUrl = await acquireV4DownloadUrl(xtlink, file_id, customToken);
 			}
 
 			if (!upstreamUrl) {
@@ -1386,12 +1715,12 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 				return;
 			} else {
 				// v4 客户端模式
-				const customToken = params.get('token') || params.get('session');
-				const token = customToken || (await getV4AccessToken());
+				const customToken = params.get('token') || params.get('session') || undefined;
 
 				if (file_id.length > 0) {
 					filesToDownload = file_id.map((key) => ({ key }));
 				} else {
+					const token = customToken || (await getV4AccessToken());
 					filesToDownload = await v4Api.list(xtlink, token);
 				}
 
@@ -1400,8 +1729,12 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 						if (!download) {
 							return file;
 						} else {
-							const dl = await v4Api.download(xtlink!, file.key, token);
-							return { ...file, downloadUrl: dl.download_url };
+							const downloadUrl = await resolveV4DownloadUrl(
+								xtlink!,
+								file.key,
+								customToken
+							);
+							return { ...file, downloadUrl };
 						}
 					})
 				);
@@ -1415,9 +1748,24 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 		res.writeHead(404);
 		res.end('Not Found');
 	} catch (error: any) {
-		console.error(error);
-		const status = error instanceof UpstreamError ? 502 : 500;
-		res.writeHead(status, { 'Content-Type': 'application/json' });
+		// aria2 只会在日志里显示 status=500/502，真正的原因必须看服务端日志。
+		console.error(
+			`[request] ${req.method} ${pathname} 处理失败: ${error?.message || error}`,
+			error?.stack || ''
+		);
+		let status = 500;
+		let retryAfter: string | undefined;
+		if (error instanceof UpstreamNetworkError) {
+			// 上游网络错误/限流：用 503 明确告知调用方可重试
+			status = 503;
+			retryAfter = '2';
+		} else if (error instanceof UpstreamError) {
+			status = 502;
+		}
+
+		const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+		if (retryAfter) headers['Retry-After'] = retryAfter;
+		res.writeHead(status, headers);
 		res.end(JSON.stringify({ code: status, error: error.message }));
 	}
 }
